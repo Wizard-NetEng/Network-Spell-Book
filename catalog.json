@@ -1,0 +1,434 @@
+{
+  "_comment": "Network Spell Book catalog. Pure data: no commands are ever executed from this file. 'cmd' strings are reference text shown in the UI and copied to the clipboard on request; the plugin never runs them.",
+  "version": 1,
+  "categories": [
+    {
+      "name": "Capture & Analyze",
+      "blurb": "See the actual packets on the wire.",
+      "tools": [
+        {
+          "bin": "tcpdump",
+          "pkg": "tcpdump",
+          "repo": "repo",
+          "what": "CLI packet capture. The Linux equivalent of a SPAN session, running on your own NIC. Works over SSH and inside containers where a GUI cannot.",
+          "cmd": "sudo tcpdump -i wlo1 -n port 53",
+          "note": "-n skips name resolution. Add -w file.pcap to save for later analysis."
+        },
+        {
+          "bin": "tshark",
+          "pkg": "wireshark-cli",
+          "repo": "repo",
+          "what": "Wireshark's dissection engine without the GUI. Scriptable, with the same protocol decoders.",
+          "cmd": "sudo tshark -i wlo1 -f \"icmp\"",
+          "note": "-f is a capture filter (BPF); -Y is a display filter (Wireshark syntax)."
+        },
+        {
+          "bin": "wireshark",
+          "pkg": "wireshark-qt",
+          "repo": "repo",
+          "what": "Full graphical protocol analyzer. Use it to think about a capture, not to take one.",
+          "cmd": "wireshark -r capture.pcap",
+          "note": "Capture on the box with the problem; analyze on the box with a screen."
+        },
+        {
+          "bin": "termshark",
+          "pkg": "termshark",
+          "repo": "repo",
+          "what": "Wireshark's interactive UI inside the terminal. The best way to read a pcap over SSH.",
+          "cmd": "termshark -r capture.pcap",
+          "note": "Reads anything tcpdump or tshark wrote."
+        },
+        {
+          "bin": "ngrep",
+          "pkg": "ngrep",
+          "repo": "repo",
+          "what": "grep for network traffic. Matches a regex against packet payloads.",
+          "cmd": "sudo ngrep -d wlo1 -q \"GET\" tcp port 80",
+          "note": "Only useful on unencrypted traffic."
+        },
+        {
+          "bin": "tcpreplay",
+          "pkg": "tcpreplay",
+          "repo": "repo",
+          "what": "Replay a captured pcap back onto an interface. Reproduce a traffic pattern in a lab on demand.",
+          "cmd": "sudo tcpreplay -i eth0 capture.pcap",
+          "note": "Replay into a lab, never into production."
+        }
+      ]
+    },
+    {
+      "name": "DNS",
+      "blurb": "Name resolution, interrogated properly.",
+      "tools": [
+        {
+          "bin": "dig",
+          "pkg": "bind",
+          "repo": "repo",
+          "what": "The authoritative DNS query tool. Ask a specific server a specific question and see the full response including flags and timing.",
+          "cmd": "dig @1.1.1.1 example.com A",
+          "note": "+short for just the answer, +trace to follow delegation from the root."
+        },
+        {
+          "bin": "host",
+          "pkg": "bind",
+          "repo": "repo",
+          "what": "Quick one-line name lookup. Good enough for 'what is this A record'.",
+          "cmd": "host example.com",
+          "note": "Simpler output than dig, less detail."
+        },
+        {
+          "bin": "nslookup",
+          "pkg": "bind",
+          "repo": "repo",
+          "what": "Interactive resolver query, familiar from Windows. Works fine, but dig is the Linux-native choice.",
+          "cmd": "nslookup example.com 1.1.1.1",
+          "note": "Kept for muscle memory; prefer dig for real work."
+        },
+        {
+          "bin": "doggo",
+          "pkg": "doggo",
+          "repo": "repo",
+          "what": "Modern DNS client with colorized output and DoH/DoT support built in.",
+          "cmd": "doggo example.com @1.1.1.1",
+          "note": "Easier to read than dig; dig is still the one on every server."
+        }
+      ]
+    },
+    {
+      "name": "Path & Reachability",
+      "blurb": "Is it up, how do we get there, and where does it break.",
+      "tools": [
+        {
+          "bin": "ping",
+          "pkg": "iputils",
+          "repo": "repo",
+          "what": "Layer 3 reachability and round-trip time. The first question you ever ask.",
+          "cmd": "ping -c4 1.1.1.1",
+          "note": "-c bounds the count so it exits on its own."
+        },
+        {
+          "bin": "arping",
+          "pkg": "iputils",
+          "repo": "repo",
+          "what": "Layer 2 reachability via ARP. Proves a host is on your local segment even when it ignores ICMP.",
+          "cmd": "sudo arping -c3 198.51.100.1",
+          "note": "Only works on the local broadcast domain — it does not route."
+        },
+        {
+          "bin": "traceroute",
+          "pkg": "traceroute",
+          "repo": "repo",
+          "what": "Hop-by-hop path discovery using TTL expiry.",
+          "cmd": "traceroute 1.1.1.1",
+          "note": "-I uses ICMP, -T uses TCP when UDP probes are filtered."
+        },
+        {
+          "bin": "mtr",
+          "pkg": "mtr",
+          "repo": "repo",
+          "what": "Traceroute and ping combined, updating continuously. Shows WHERE loss happens, not merely that it does.",
+          "cmd": "mtr 1.1.1.1",
+          "note": "Loss on middle hops is usually ICMP rate-limiting. Only the final hop's loss is real."
+        },
+        {
+          "bin": "trippy",
+          "pkg": "trippy",
+          "repo": "repo",
+          "what": "Modern traceroute/mtr in one TUI, with per-hop history and jitter graphs.",
+          "cmd": "sudo trip 1.1.1.1",
+          "note": "Binary is named 'trip'. Same ICMP rate-limit caveat as mtr."
+        },
+        {
+          "bin": "fping",
+          "pkg": "fping",
+          "repo": "repo",
+          "what": "Ping many hosts in parallel. Sweep a subnet for what answers.",
+          "cmd": "fping -a -g 198.51.100.0/22 2>/dev/null",
+          "note": "-a lists only alive hosts; -g takes a range or CIDR."
+        },
+        {
+          "bin": "iperf3",
+          "pkg": "iperf3",
+          "repo": "repo",
+          "what": "Measure real throughput between two hosts with generated traffic. Turns 'the link feels slow' into a number.",
+          "cmd": "iperf3 -c 192.0.2.10",
+          "note": "Needs a server at the far end: iperf3 -s"
+        }
+      ]
+    },
+    {
+      "name": "Layer 1 & 2",
+      "blurb": "The physical and link-layer truth.",
+      "tools": [
+        {
+          "bin": "ethtool",
+          "pkg": "ethtool",
+          "repo": "repo",
+          "what": "NIC speed, duplex, autonegotiation and error counters. Your 'show interface' for physical detail.",
+          "cmd": "sudo ethtool enp3s0",
+          "note": "On WiFi use 'iw dev wlo1 link' instead — far more useful than ethtool there."
+        },
+        {
+          "bin": "lldpctl",
+          "pkg": "lldpd",
+          "repo": "repo",
+          "what": "LLDP/CDP neighbor discovery. Tells you which switch and which port you are plugged into, and often the VLAN.",
+          "cmd": "lldpctl",
+          "note": "Needs the daemon running: sudo systemctl enable --now lldpd. It advertises you on the wire."
+        },
+        {
+          "bin": "tio",
+          "pkg": "tio",
+          "repo": "aur",
+          "what": "Serial console client. Replaces PuTTY/minicom for console-cable work on real gear.",
+          "cmd": "tio /dev/ttyUSB0",
+          "note": "Default 115200 8N1. Ctrl-t q to quit, Ctrl-t ? for help."
+        },
+        {
+          "bin": "ip",
+          "pkg": "iproute2",
+          "repo": "repo",
+          "what": "The modern Linux interface, address and route command. Replaces ifconfig and route entirely.",
+          "cmd": "ip -br addr",
+          "note": "-br gives brief output. Also: ip -br link, ip route, ip neigh."
+        },
+        {
+          "bin": "bridge",
+          "pkg": "iproute2",
+          "repo": "repo",
+          "what": "Inspect and configure Linux bridges, including VLAN filtering and FDB entries.",
+          "cmd": "bridge link show",
+          "note": "bridge fdb show is the Linux equivalent of 'show mac address-table'."
+        }
+      ]
+    },
+    {
+      "name": "Sockets & Traffic",
+      "blurb": "What is connected, and who is using the pipe.",
+      "tools": [
+        {
+          "bin": "ss",
+          "pkg": "iproute2",
+          "repo": "repo",
+          "what": "Socket statistics: listening ports, established connections, owning processes. Replaces netstat.",
+          "cmd": "ss -tulpn",
+          "note": "t=TCP u=UDP l=listening p=process n=numeric. Needs sudo to see other users' processes."
+        },
+        {
+          "bin": "iftop",
+          "pkg": "iftop",
+          "repo": "repo",
+          "what": "Live bandwidth by connection pair. Shows which conversation is consuming the link.",
+          "cmd": "sudo iftop -i wlo1",
+          "note": "Press 'n' to stop resolving names when the display churns."
+        },
+        {
+          "bin": "nethogs",
+          "pkg": "nethogs",
+          "repo": "repo",
+          "what": "Live bandwidth grouped by process. Answers 'what on this machine is using the network'.",
+          "cmd": "sudo nethogs wlo1",
+          "note": "The per-process view iftop does not give you."
+        },
+        {
+          "bin": "bandwhich",
+          "pkg": "bandwhich",
+          "repo": "repo",
+          "what": "Terminal bandwidth monitor by process, connection and remote host at once.",
+          "cmd": "sudo bandwhich",
+          "note": "Combines the nethogs and iftop views in one screen."
+        },
+        {
+          "bin": "vnstat",
+          "pkg": "vnstat",
+          "repo": "repo",
+          "what": "Long-term traffic accounting per interface. Answers 'how much did we move last month'.",
+          "cmd": "vnstat -i wlo1 -m",
+          "note": "Needs its daemon collecting over time: systemctl enable --now vnstat."
+        }
+      ]
+    },
+    {
+      "name": "Discovery & Probing",
+      "blurb": "What is out there, and does the port answer.",
+      "tools": [
+        {
+          "bin": "nmap",
+          "pkg": "nmap",
+          "repo": "repo",
+          "what": "Host discovery, port scanning, service and OS fingerprinting. The standard tool for mapping a network.",
+          "cmd": "nmap -sn 198.51.100.0/22",
+          "note": "-sn is host discovery only, no port scan. Scan only networks you own or administer."
+        },
+        {
+          "bin": "ncat",
+          "pkg": "nmap",
+          "repo": "repo",
+          "what": "Modern netcat: open, read and write arbitrary TCP/UDP connections. Test whether a port truly answers.",
+          "cmd": "ncat -vz 192.0.2.10 443",
+          "note": "-v verbose, -z scan without sending data."
+        },
+        {
+          "bin": "socat",
+          "pkg": "socat",
+          "repo": "repo",
+          "what": "Arbitrary bidirectional socket plumbing: relays, port forwards, serial-to-TCP bridges.",
+          "cmd": "socat -d -d TCP-LISTEN:8080,fork TCP:192.0.2.10:80",
+          "note": "Enormously capable and easy to misuse. Learn it after ncat."
+        },
+        {
+          "bin": "arp-scan",
+          "pkg": "arp-scan",
+          "repo": "repo",
+          "what": "Layer 2 host discovery by ARP sweep. Finds hosts that ignore ping, including their MAC vendor.",
+          "cmd": "sudo arp-scan --localnet",
+          "note": "Local segment only. Often finds devices nmap -sn misses."
+        },
+        {
+          "bin": "whois",
+          "pkg": "whois",
+          "repo": "repo",
+          "what": "Registration lookup for a domain or IP block: owner, netblock, abuse contact.",
+          "cmd": "whois 1.1.1.1",
+          "note": "Identifies which provider owns an address you saw in a traceroute."
+        },
+        {
+          "bin": "curl",
+          "pkg": "curl",
+          "repo": "repo",
+          "what": "HTTP and API client. Check headers, status codes, TLS and redirects.",
+          "cmd": "curl -I https://example.com",
+          "note": "-I headers only, -v shows the full TLS handshake and request."
+        }
+      ]
+    },
+    {
+      "name": "Addressing Math",
+      "blurb": "Subnets, masks and wildcards without arithmetic errors.",
+      "tools": [
+        {
+          "bin": "ipcalc",
+          "pkg": "ipcalc",
+          "repo": "repo",
+          "what": "Subnet calculator with binary breakdown, showing exactly where the mask boundary falls. Excellent for learning and explaining.",
+          "cmd": "ipcalc 198.51.100.42/22",
+          "note": "The binary column makes the mask boundary obvious at a glance."
+        },
+        {
+          "bin": "sipcalc",
+          "pkg": "sipcalc",
+          "repo": "aur",
+          "what": "Terse scriptable subnet calculator with strong IPv6 support and VLSM splitting. Gives Cisco wildcard masks directly.",
+          "cmd": "sipcalc 198.51.100.42/22",
+          "note": "Split a block: sipcalc -s 24 198.51.100.0/22"
+        }
+      ]
+    },
+    {
+      "name": "Device Management",
+      "blurb": "Reaching and configuring the gear itself.",
+      "tools": [
+        {
+          "bin": "ssh",
+          "pkg": "openssh",
+          "repo": "repo",
+          "what": "Encrypted remote shell. Your primary access method to every device that has an IP.",
+          "cmd": "ssh admin@192.0.2.1",
+          "note": "Per-host options belong in ~/.ssh/config, not in aliases."
+        },
+        {
+          "bin": "snmpwalk",
+          "pkg": "net-snmp",
+          "repo": "repo",
+          "what": "Walk a device's SNMP tree: interfaces, counters, uptime, inventory. Read-only monitoring data.",
+          "cmd": "snmpwalk -v2c -c public 192.0.2.1 system",
+          "note": "Never use 'public' on a real network. Prefer SNMPv3 with auth and privacy."
+        },
+        {
+          "bin": "snmpget",
+          "pkg": "net-snmp",
+          "repo": "repo",
+          "what": "Fetch one specific SNMP OID rather than walking a whole subtree.",
+          "cmd": "snmpget -v2c -c public 192.0.2.1 sysUpTime.0",
+          "note": "Use snmptranslate to turn a numeric OID into a readable name."
+        },
+        {
+          "bin": "ansible",
+          "pkg": "ansible",
+          "repo": "repo",
+          "what": "Configuration automation with vendor collections for IOS, NX-OS, EOS and JunOS. Push verified config to many devices at once.",
+          "cmd": "ansible-galaxy collection install cisco.ios",
+          "note": "Bigger hammer than netmiko, steeper climb. Worth it past about ten devices."
+        },
+        {
+          "bin": "sshuttle",
+          "pkg": "sshuttle",
+          "repo": "repo",
+          "what": "Routes your traffic over a plain SSH connection — a VPN without a VPN server.",
+          "cmd": "sshuttle -r user@jumphost 192.0.2.0/24",
+          "note": "Needs only SSH access and Python on the far end."
+        }
+      ]
+    },
+    {
+      "name": "Firewall",
+      "blurb": "Packet filtering on this machine.",
+      "tools": [
+        {
+          "bin": "nft",
+          "pkg": "nftables",
+          "repo": "repo",
+          "what": "The current Linux firewall framework. One tool for IPv4, IPv6, ARP and bridge filtering.",
+          "cmd": "sudo nft list ruleset",
+          "note": "Replaces iptables. Rules live in /etc/nftables.conf."
+        },
+        {
+          "bin": "ufw",
+          "pkg": "ufw",
+          "repo": "repo",
+          "what": "Simplified firewall front-end for straightforward allow/deny rules.",
+          "cmd": "sudo ufw status verbose",
+          "note": "Fine for a laptop; use nft directly for anything nuanced."
+        },
+        {
+          "bin": "iptables",
+          "pkg": "iptables",
+          "repo": "repo",
+          "what": "The legacy packet filter. You will still meet it in older documentation and on older systems.",
+          "cmd": "sudo iptables -L -n -v",
+          "note": "Superseded by nftables. Know it for reading, write new rules in nft."
+        }
+      ]
+    },
+    {
+      "name": "Lab & Simulation",
+      "blurb": "Practice topologies without touching production.",
+      "tools": [
+        {
+          "bin": "gns3",
+          "pkg": "gns3-gui",
+          "repo": "aur",
+          "what": "Network simulator running real vendor images alongside containers and VMs. Build a topology and break it safely.",
+          "cmd": "gns3",
+          "note": "Needs gns3-server running. Pairs with dynamips and docker."
+        },
+        {
+          "bin": "dynamips",
+          "pkg": "dynamips",
+          "repo": "aur",
+          "what": "Cisco IOS emulator underneath GNS3. Runs genuine IOS images for classic routers.",
+          "cmd": "dynamips -H 7200",
+          "note": "Usually driven by GNS3 rather than invoked directly."
+        },
+        {
+          "bin": "docker",
+          "pkg": "docker",
+          "repo": "repo",
+          "what": "Containers — increasingly how network services and lab nodes are shipped and run.",
+          "cmd": "docker ps -a",
+          "note": "GNS3 can use containers as topology nodes."
+        }
+      ]
+    }
+  ]
+}

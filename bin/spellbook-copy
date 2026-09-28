@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# spellbook-copy — put a reference command on the clipboard.
+#
+# The text arrives on STDIN, never as an argument. Two reasons:
+#   1. argv is world-readable via /proc, so anything passed positionally is
+#      visible to every user on the machine for the life of the process.
+#   2. A command string beginning with "-" would otherwise be parsed as an
+#      option by the clipboard tool rather than as data.
+#
+# This script copies text. It does not evaluate it, and there is deliberately
+# no code path in this plugin that executes a catalogued command.
+
+set -euo pipefail
+
+# Refuse absurd input rather than handing an unbounded buffer to the clipboard.
+MAX_BYTES="${SPELLBOOK_COPY_MAX:-8192}"
+
+payload="$(head -c "$((MAX_BYTES + 1))")"
+
+if [ "${#payload}" -gt "$MAX_BYTES" ]; then
+  echo "refusing to copy more than ${MAX_BYTES} bytes" >&2
+  exit 1
+fi
+
+if [ -z "$payload" ]; then
+  echo "nothing to copy" >&2
+  exit 1
+fi
+
+if command -v wl-copy >/dev/null 2>&1; then
+  printf '%s' "$payload" | wl-copy
+elif command -v xclip >/dev/null 2>&1; then
+  printf '%s' "$payload" | xclip -selection clipboard
+else
+  echo "no clipboard tool found (wl-copy or xclip)" >&2
+  exit 1
+fi

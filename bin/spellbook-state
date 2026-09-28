@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""spellbook-state — read and write the plugin's UI state safely.
+
+This exists because a QML FileView pointed at a fixed path is not safe to use
+for state that lives in a world-writable-adjacent location:
+
+  * `setText()` on a fixed path FOLLOWS a pre-existing symlink, so anything
+    able to plant `ui-state.json` as a link redirects our write to another
+    file the user can write. Same for the read side.
+  * `chmod 0700 <fixed dir>` follows a symlinked directory and retargets the
+    permission change onto an unrelated directory.
+  * FileView has no producer-side size cap, so a large or special file
+    (FIFO, /proc entry) is read into the UI unbounded.
+
+Every unsafe pattern above is a check-then-act race. Checking with lstat()
+first does not fix it, because the path can be swapped between the check and
+the open. The fix is to make the KERNEL do the refusing, atomically:
+
+  * Open the state directory with O_NOFOLLOW|O_DIRECTORY once, and do every
+    subsequent operation relative to that descriptor (`dir_fd=`). A symlinked
+    directory fails the open outright; after that the directory cannot be
+    swapped underneath us, because we hold the real one.
+  * Open the state file with O_NOFOLLOW relative to that descriptor, so a
+    symlinked file fails rather than redirecting.
+  * Verify ownership and file type with fstat() on the OPEN descriptor, never
+    with stat() on the path.
+  * Write via an O_CREAT|O_EXCL temp file in the same directory (mode 0600,
+    never world-readable even briefly) and rename it into place with both
+    ends relative to the held descriptor.
+
+Usage:
+    spellbook-state read              # JSON state to stdout
+    spellbook-state write             # JSON state on stdin
+"""
+
+from __future__ import annotations
+
+import errno
+import json
+import os
+import secrets
+import stat
+import sys
+
+MAX_BYTES = 256 * 1024
+MAX_ENTRIES = 4096
+MAX_NAME = 512
+
+
+def die(msg: str) -> None:
+    json.dump({"ok": False, "error": str(msg)[:300], "collapsed": []}, sys.stdout)
+    sys.stdout.write("\n")
+    sys.exit(1)
+
+
+def state_dir_path() -> str:
+    home = os.environ.get("HOME")
+    if not home:
+        die("HOME is not set")
+    return os.path.join(home, ".config", "omarchy", "spellbook")
+
+
+def open_state_dir(create: bool) -> int:
+    """Open the state directory without following a symlink.
+
+    Returns a descriptor to the real directory. Every later operation is
+    performed relative to it, which removes the window in which the path
+    could be swapped.
+    """
+    path = state_dir_path()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if not create:
+            raise
+        # Build the intermediate path. os.mkdir() does not create parents, and
+        # makedirs() would happily walk through a symlinked component, so each
+        # level is created explicitly and the final component gets 0700.
+        home = os.environ.get("HOME", "")
+        parent = os.path.join(home, ".config", "omarchy")
+        for step in (os.path.join(home, ".config"), parent, path):
+            try:
+                os.mkdir(step, 0o700 if step == path else 0o755)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                die(f"cannot create state directory: {exc}")
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            die(f"cannot open state directory: {exc}")
+    except OSError as exc:
+        # A symlinked directory fails here rather than being followed. Linux
+        # reports ENOTDIR for O_NOFOLLOW|O_DIRECTORY on a symlink-to-directory
+        # and ELOOP for O_NOFOLLOW on other symlinks; both mean the same thing
+        # to us, so name the cause rather than leaking a raw errno string.
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            die("state directory is a symlink or not a directory; refusing to use it")
+        die(f"cannot open state directory: {exc}")
+
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        os.close(fd)
+        die("state directory is not a directory")
+    if st.st_uid != os.getuid():
+        os.close(fd)
+        die("state directory is not owned by this user; refusing to use it")
+    # Tighten on the DESCRIPTOR, so this cannot be retargeted by a swap.
+    if st.st_mode & 0o077:
+        try:
+            os.fchmod(fd, 0o700)
+        except OSError:
+            pass
+    return fd
+
+
+def read_state() -> dict:
+    try:
+        dfd = open_state_dir(create=False)
+    except FileNotFoundError:
+        return {"ok": True, "error": "", "collapsed": [], "present": False}
+
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        try:
+            ffd = os.open("ui-state.json", flags, dir_fd=dfd)
+        except FileNotFoundError:
+            return {"ok": True, "error": "", "collapsed": [], "present": False}
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                die("ui-state.json is a symlink; refusing to read it")
+            die(f"cannot open ui-state.json: {exc}")
+
+        try:
+            st = os.fstat(ffd)
+            # A FIFO or device node reports 0 bytes and then streams forever.
+            if not stat.S_ISREG(st.st_mode):
+                die("ui-state.json is not a regular file; refusing to read it")
+            if st.st_uid != os.getuid():
+                die("ui-state.json is not owned by this user")
+            # Cap the READ itself; the size can change after fstat.
+            blob = os.read(ffd, MAX_BYTES + 1)
+            more = os.read(ffd, 1)
+        finally:
+            os.close(ffd)
+
+        if len(blob) > MAX_BYTES or more:
+            die(f"ui-state.json exceeds {MAX_BYTES} bytes")
+
+        try:
+            doc = json.loads(blob.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            # Corrupt state is not fatal: start empty rather than refusing.
+            return {"ok": True, "error": "", "collapsed": [], "present": True}
+
+        if not isinstance(doc, dict):
+            return {"ok": True, "error": "", "collapsed": [], "present": True}
+
+        raw = doc.get("collapsed", [])
+        if not isinstance(raw, list):
+            raw = []
+        out = []
+        for item in raw[:MAX_ENTRIES]:
+            if isinstance(item, str):
+                cleaned = "".join(c for c in item if c >= " " and c != "\x7f")
+                if cleaned:
+                    out.append(cleaned[:MAX_NAME])
+        return {"ok": True, "error": "", "collapsed": out, "present": True}
+    finally:
+        os.close(dfd)
+
+
+def write_state(payload: str) -> dict:
+    try:
+        doc = json.loads(payload or "{}")
+    except json.JSONDecodeError as exc:
+        die(f"state is not valid JSON: {exc}")
+    if not isinstance(doc, dict):
+        die("state root must be a JSON object")
+
+    raw = doc.get("collapsed", [])
+    if not isinstance(raw, list):
+        raw = []
+    names = []
+    for item in raw[:MAX_ENTRIES]:
+        if isinstance(item, str):
+            cleaned = "".join(c for c in item if c >= " " and c != "\x7f")
+            if cleaned:
+                names.append(cleaned[:MAX_NAME])
+
+    blob = json.dumps({"collapsed": names}, indent=2) + "\n"
+
+    dfd = open_state_dir(create=True)
+    try:
+        # O_EXCL with an unpredictable name: a planted file or symlink at the
+        # temp path makes the open fail instead of being followed.
+        tmp_name = f".ui-state.json.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        try:
+            tfd = os.open(tmp_name, flags, 0o600, dir_fd=dfd)
+        except OSError as exc:
+            die(f"cannot create temp state file: {exc}")
+        try:
+            with os.fdopen(tfd, "w", encoding="utf-8") as fh:
+                fh.write(blob)
+                fh.flush()
+                os.fsync(fh.fileno())
+            # Both ends relative to the held descriptor: the rename cannot be
+            # redirected by swapping the directory path.
+            os.replace(tmp_name, "ui-state.json", src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            try:
+                os.unlink(tmp_name, dir_fd=dfd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dfd)
+
+    return {"ok": True, "error": "", "collapsed": names}
+
+
+def main() -> None:
+    if len(sys.argv) != 2 or sys.argv[1] not in ("read", "write"):
+        die("usage: spellbook-state read|write")
+    if sys.argv[1] == "read":
+        result = read_state()
+    else:
+        result = write_state(sys.stdin.read(MAX_BYTES + 1))
+    json.dump(result, sys.stdout)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()
